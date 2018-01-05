@@ -2,13 +2,17 @@ import telebot
 import configparser
 import tweepy
 import logging
+import re
 
 character_limit = 280
 
 logging.basicConfig(level = logging.DEBUG)
 
+user_prefs_section_name = "user preferences"
+
+config_path = "post_to_twitter_bot.cfg"
 config = configparser.ConfigParser()
-config.read("post_to_twitter_bot.cfg")
+config.read(config_path)
 
 bot = telebot.TeleBot(config['telegram_bot_api']['telegram_token'])
 
@@ -19,6 +23,28 @@ auth.set_access_token(config['twitter_api']['access_token'],
 api = tweepy.API(auth)  
 
 open_requests = {}
+
+def use_nickname(user):
+  user_is_bot = user.username is not None and user.username[-3:].lower() is "bot"
+  return not user_is_bot
+
+@bot.message_handler(commands=['setnick'])
+def handle_setnick(message):
+  nick = message.text
+  # TODO(gus) lots of hardcoding
+  nick = re.sub("/setnick", "", nick)
+  nick = re.sub("@post_to_twitter_bot", "", nick)
+  nick = nick.strip()
+  
+  logging.info("Setting user {0}'s nickname to {1}.".format(message.from_user.id, nick))
+
+  if user_prefs_section_name not in config:
+    config.add_section(user_prefs_section_name)
+  config.set(user_prefs_section_name, str(message.from_user.id), nick)
+
+  # TODO(gus) writing every time?
+  with open(config_path, "w") as config_file:
+    config.write(config_file)
 
 @bot.message_handler(commands=['post'], 
                       func=lambda m: (m.from_user.id , m.chat.id) not in open_requests
@@ -37,9 +63,29 @@ def handle_post_step2(message):
   logging.info("Finishing up request from " + str(request_id))
 
   messages = sorted(open_requests[request_id], key=lambda m: m.date)
-  output = "\n".join([m.forward_from.first_name + ": " + m.text for m in messages])
-  logging.info("MESSAGE TO TWEET:\n" + output + "\nEND OF MESSAGE")
 
+  # Check that all users have set their nickname preference.
+  users_without_nicknames = []
+  for m in messages:
+    if use_nickname(m.forward_from) \
+        and user_prefs_section_name in config \
+        and str(m.forward_from.id) in config[user_prefs_section_name]:
+      pass
+    else:
+      users_without_nicknames.append(m.forward_from)
+  if len(users_without_nicknames) > 0:
+    bot.reply_to(message, "The following users have not set their nickname: " +
+                    " ".join(["[{0}](tg://user?id={1})".format(u.first_name, 
+                                                              u.id) 
+                              for u in users_without_nicknames]) +
+                    # TODO(gus) hardcoded command
+                    ". Please set your nickname with the /setnick command.",
+                    parse_mode = "Markdown")
+    return
+
+  # Create tweet.
+  output = "\n".join([config[user_prefs_section_name][str(m.forward_from.id)] + ": " + m.text for m in messages])
+  logging.info("MESSAGE TO TWEET:\n" + output + "\nEND OF MESSAGE")
   if len(output) <= character_limit:
     api.update_status(output)
   else:
