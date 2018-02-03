@@ -3,6 +3,7 @@ import configparser
 import tweepy
 import logging
 import re
+from telebot import types
 
 character_limit = 280
 
@@ -23,9 +24,15 @@ auth.set_access_token(config['twitter_api']['access_token'],
 api = tweepy.API(auth)  
 
 open_requests = {}
+open_votes = {}
 
 def use_nickname(user):
-  user_is_bot = user.username is not None and user.username[-3:].lower() is "bot"
+  logging.info(user.username[-3:].lower())
+  user_is_bot = user.username is not None and user.username[-3:].lower() == "bot"
+  return not user_is_bot
+
+def must_vote(user):
+  user_is_bot = user.username is not None and user.username[-3:].lower() == "bot"
   return not user_is_bot
 
 @bot.message_handler(commands=['setnick'])
@@ -55,36 +62,11 @@ def handle_post_step1(message):
   open_requests[request_id] = []
   bot.reply_to(message, "Alright, now forward the messages you'd like me to post.")
 
-@bot.message_handler(commands=['post'], 
-                      func=lambda m: (m.from_user.id , m.chat.id) in open_requests
-                                      and m.forward_date is None)
-def handle_post_step2(message):
-  request_id = (message.from_user.id , message.chat.id)
-  logging.info("Finishing up request from " + str(request_id))
-
+def post(request_id):
   messages = sorted(open_requests[request_id], key=lambda m: m.date)
 
-  # Check that all users have set their nickname preference.
-  users_without_nicknames = []
-  for m in messages:
-    if use_nickname(m.forward_from) \
-        and user_prefs_section_name in config \
-        and str(m.forward_from.id) in config[user_prefs_section_name]:
-      pass
-    else:
-      users_without_nicknames.append(m.forward_from)
-  if len(users_without_nicknames) > 0:
-    bot.reply_to(message, "The following users have not set their nickname: " +
-                    " ".join(["[{0}](tg://user?id={1})".format(u.first_name, 
-                                                              u.id) 
-                              for u in users_without_nicknames]) +
-                    # TODO(gus) hardcoded command
-                    ". Please set your nickname with the /setnick command.",
-                    parse_mode = "Markdown")
-    return
-
   # Create tweet.
-  output = "\n".join([config[user_prefs_section_name][str(m.forward_from.id)] + ": " + m.text for m in messages])
+  output = "\n".join([ (config[user_prefs_section_name][str(m.forward_from.id)] if use_nickname(m.forward_from) else m.forward_from.first_name) + ": " + m.text for m in messages])
   logging.info("MESSAGE TO TWEET:\n" + output + "\nEND OF MESSAGE")
   if len(output) <= character_limit:
     api.update_status(output)
@@ -120,8 +102,67 @@ def handle_post_step2(message):
     
 
   # TODO(gus) synchronization?
-  del open_requests[request_id]
+  if request_id in open_requests: del open_requests[request_id]
+  if request_id in open_votes: del open_votes[request_id]
 
+@bot.message_handler(commands=['post'], 
+                      func=lambda m: (m.from_user.id , m.chat.id) in open_requests
+                                      and m.forward_date is None)
+def handle_post_step2(message):
+  request_id = (message.from_user.id , message.chat.id)
+  messages = sorted(open_requests[request_id], key=lambda m: m.date)
+
+  # Check that all users have set their nickname preference.
+  users_without_nicknames = set()
+  for m in messages:
+    if use_nickname(m.forward_from):
+      if user_prefs_section_name in config \
+          and str(m.forward_from.id) in config[user_prefs_section_name]:
+        pass
+      else:
+        users_without_nicknames.add(m.forward_from)
+  if len(users_without_nicknames) > 0:
+    bot.reply_to(message, "The following users have not set their nickname: " +
+                    " ".join(["[{0}](tg://user?id={1})".format(u.first_name, 
+                                                              u.id) 
+                              for u in users_without_nicknames]) +
+                    # TODO(gus) hardcoded command
+                    ". Please set your nickname with the /setnick command.",
+                    parse_mode = "Markdown")
+    return
+
+  # Start vote.
+  vote_set = set()
+  for m in messages:
+    if must_vote(m.forward_from):
+      vote_set.add(m.forward_from.id)
+  if len(vote_set) == 0: 
+    post(request_id)
+  else:
+    markup = types.InlineKeyboardMarkup()
+    markup.row(types.InlineKeyboardButton(callback_data="yes", text="yes"),
+                types.InlineKeyboardButton(callback_data="no", text="no"))
+    out = bot.send_message(message.chat.id, "Should I post these messages?",
+        reply_markup=markup, parse_mode="Markdown")
+
+    open_votes[out] = {
+      'set' : vote_set,
+      'request_id' : request_id
+    }
+
+@bot.callback_query_handler(func=lambda call: call.message.message_id in open_votes)
+def call(call):
+  logging.info("Got callback query for message " + str(call.message.message_id))
+  request_id = open_votes[call.message.message_id]['message_id']
+  if (call.data is "no"):
+    # TODO(gus) put this in a function
+    if request_id in open_request: del open_request[request_id]
+    if request_id in open_votes: del open_votes[request_id]
+    return
+
+  open_votes[call.message.message_id]['set'].remove(call.from_user.id)
+  if len(open_votes[call.message.message_id]['set']) == 0:
+    post(request_id)
 
 @bot.message_handler(func=lambda m: m.forward_date is not None
                                     and (m.from_user.id , m.chat.id) in open_requests)
